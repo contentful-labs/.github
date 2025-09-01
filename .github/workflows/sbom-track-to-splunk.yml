@@ -1,0 +1,96 @@
+name: sbom-track-to-splunk
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    env:
+      SPLUNK_HEC_URL: ${{ secrets.SPLUNK_HEC_URL }}
+      SPLUNK_HEC_TOKEN: ${{ secrets.SPLUNK_HEC_TOKEN }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed dep files (JS/Ruby/Go/Python)
+        id: changed
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            **/package.json
+            **/package-lock.json
+            **/yarn.lock
+            **/pnpm-lock.yaml
+            **/Gemfile.lock
+            **/go.mod
+            **/go.sum
+            **/requirements.txt
+            **/requirements-*.txt
+            **/poetry.lock
+            **/Pipfile.lock
+
+      - name: Generate CycloneDX SBOM with Syft
+        if: steps.changed.outputs.any_changed == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Send SBOM to Splunk HEC (batched)
+        if: steps.changed.outputs.any_changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -s sbom.cdx.json ] || { echo "[hec] ERROR: SBOM missing"; exit 1; }
+
+          repo="$GITHUB_REPOSITORY"
+          commit="$GITHUB_SHA"
+          ref="$GITHUB_REF"
+          actor="$GITHUB_ACTOR"
+
+          count=$(jq '.components|length // 0' sbom.cdx.json)
+          echo "[hec] components: $count"
+
+          if [ "$count" -eq 0 ]; then
+            jq -nc --arg repo "$repo" --arg commit "$commit" --arg ref "$ref" --arg actor "$actor" \
+              '{event:{note:"no components", repo:$repo, commit:$commit, actor:$actor, ref:$ref},
+                fields:{repo:$repo,sha:$commit,ref:$ref,spec:"cyclonedx"}}' \
+            | curl -fSs -H "Authorization: Splunk $SPLUNK_HEC_TOKEN" \
+                       -H "Content-Type: application/json" \
+                       --data-binary @- "$SPLUNK_HEC_URL/services/collector"
+            echo "[hec] posted empty-components envelope"
+            exit 0
+          fi
+
+          ndjson="$(mktemp)"
+          jq -c --arg repo "$repo" --arg commit "$commit" --arg ref "$ref" --arg actor "$actor" '
+            .components[]
+            | { event: ( . + {repo:$repo, commit:$commit, actor:$actor, ref:$ref} ),
+                fields:{repo:$repo,sha:$commit,ref:$ref,spec:"cyclonedx"} }
+          ' sbom.cdx.json > "$ndjson"
+
+          batch_size=${BATCH_SIZE:-500}
+          split_prefix="$(mktemp -u hec_batch_XXXX)"
+          split -l "$batch_size" "$ndjson" "$split_prefix"
+
+          for f in ${split_prefix}*; do
+            [ -s "$f" ] || continue
+            echo "[hec] posting batch $(wc -l < "$f") events"
+            gzip -c "$f" \
+            | curl -fSs \
+                -H "Authorization: Splunk $SPLUNK_HEC_TOKEN" \
+                -H "Content-Type: application/json" \
+                -H "Content-Encoding: gzip" \
+                --data-binary @- \
+                "$SPLUNK_HEC_URL/services/collector"
+          done
+
+          rm -f "$ndjson" ${split_prefix}* || true
+          echo "[splunk] posted $count components"
